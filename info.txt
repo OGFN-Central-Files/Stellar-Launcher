@@ -1,0 +1,133 @@
+Análisis del launcher "Stellar" (C:\Users\Cris\Documents\OGFN\Cosas\Launcher\Stellar)
+Launcher de Fortnite OG (temporadas antiguas) con servidor privado propio ("Project Stellar"), versión 1.1.2 (tauri.conf.json), identifier com.stellar.dev.
+
+1. Stack tecnológico
+Capa	Tecnología
+Shell de escritorio	Tauri 2 (Rust, no Electron) — src-tauri/
+Frontend	React 19 + TypeScript 5.8
+Bundler	Vite 7 (vite.config.ts, puerto fijo 1420, alias @ → src)
+Estilos	Tailwind CSS 3 (tailwind.config.js) — mezcla confusa con @tailwindcss/vite v4 en package.json, pero src/index.css usa directivas v3
+Estado	Zustand 5 (7 stores en src/zustand/)
+Routing	react-router-dom 7 con HashRouter (src/main.tsx)
+Animaciones	framer-motion 12
+Iconos	lucide-react + react-icons
+HTTP	axios (clase propia Requests)
+Gestor de paquetes	Bun (bun.lockb; node_modules no está instalado en el disco)
+Fuente	Bricolage Grotesque (Google Fonts, index.html)
+Plugins Tauri: deep-link, dialog, fs, http, log, notification, opener, process, shell, updater, single-instance. Deps Rust relevantes: reqwest (streaming), sysinfo, winapi/windows (procesos, ShellExecuteW), tokio, winreg, tauri-plugin-updater.
+
+2. Estructura completa (sin node_modules/dist/target)
+
+text
+Stellar/
+├─ index.html, test.html (mockup de paneles glass), vite.config.ts, tsconfig.json
+├─ tailwind.config.js, postcss.config.js, package.json, bun.lockb, README.md
+├─ public/            (StellarStar.png, skin.png, seasons/season-*.jpg, slots/T-Icon-*.png)
+├─ src/
+│  ├─ main.tsx                     # HashRouter + filtro SVG glass-distortion + Particles
+│  ├─ index.css                    # fondo radial-gradient fijo, scrollbar oculta
+│  ├─ pages/                       # Login, Home, Library, Settings, Leaderboards
+│  ├─ components/
+│  │  ├─ Core/       Frame.tsx (titlebar), Particles.tsx, Sidebar.tsx
+│  │  ├─ Global/     GlassContainer.tsx, Toast.tsx
+│  │  ├─ Home/       Banner, Donate, GithubChangelogs, Header, MonthlyRewardsNotification
+│  │  ├─ Library/    BuildCard, BuildPreview, BuildsArray, ImportBuildModal,
+│  │  │              RequiredFilesDownloader, StatusOverlay
+│  │  ├─ Settings/   Option.tsx (toggle), Sidebar.tsx (subnav), modal/GradientModal.tsx,
+│  │  │              pages/{GameOptionsPage, OptionsPage, ThemePage, DeveloperPage}
+│  │  └─ Tournaments/ TournamentList, TournamentEventWindow, SessionLeaderboard
+│  ├─ fortnite/enum/EFortWeaponType.ts
+│  ├─ stellar/       index.ts, Requests.ts, Storage.ts, interfaces/{IAccount,IMCPItem,IMCPProfile,IRoute}
+│  ├─ utils/         buildUtils.ts, configuration/versionMap.ts, library/{handlePlay.ts, handleClose.ts}
+│  └─ zustand/       AuthStore, BannerStore, BuildStore, RewardsStore, RoutingStore, ThemeStore, ToastStore
+└─ src-tauri/
+   ├─ Cargo.toml, tauri.conf.json, capabilities/{default.json, desktop.json}
+   └─ src/
+      ├─ main.rs, lib.rs
+      └─ commands/  mod.rs, builds.rs, download.rs
+3. Inicio de sesión (backend externo + deep link)
+Flujo OAuth por deep link stellar://, sin formularios:
+
+Descubrimiento de rutas: src/zustand/RoutingStore.tsx → initRouting() hace GET https://prod-api-v1.stellarfn.dev/stellar/launcher/v1/routing?type=<tipo> para los tipos auth, public, account, oauth, leaderboards, tournaments, rewards. Cada tipo devuelve { url } y se cachea en localStorage (stellar:routing.store). Todas las URLs del backend son dinámicas (el launcher no hardcodea endpoints salvo el de routing y los CDN).
+src/pages/Login.tsx — botón "Continue" ("Connect your Discord account") → open(authRoute.url) (navegador del sistema, plugin-shell). Pantalla splash "Welcome to Stellar" de 2.4 s; si hay JWT válido en storage navega a /home.
+El backend web devuelve stellar://<JWT> → onOpenUrl (plugin-deep-link, esquema registrado en tauri.conf.json) captura la URL, extrae el JWT y llama AuthStore.login(jwt).
+src/zustand/AuthStore.tsx → GET <ruta "account"> con Authorization: bearer <jwt> → responde { account: IAccount, athena: IMCPProfile }. IAccount (src/stellar/interfaces/IAccount.ts): AccountID, Email, Password, DisplayName, DiscordID, IsBanned, Roles, Rewards, ProfilePicture....
+Auto-update en el login: check() del plugin-updater contra https://cdn.stellarfn.dev/update.json (pubkey minisign, installMode: passive) → downloadAndInstall + relaunch().
+4. Lanzamiento del juego (el mecanismo clave)
+Todo en src/utils/library/handlePlay.ts (TS) + src-tauri/src/commands/builds.rs (Rust).
+
+Flujo TS (handlePlay)
+invoke("exit_all") — mata procesos previos y espera 2550 ms (setTimeout).
+checkFiles(path): verifica por tamaño (Content-Length remoto vs local) estos archivos dentro de la carpeta del build:
+https://cdn.stellarfn.dev/Paks/pakchunkStellar-WindowsClient.pak/.sig y pakchunkStellar_s1-... → FortniteGame\Content\Paks
+https://cloud.arc-services.dev/modules/anticheat/Arc.exe → <build>\Arc\ (anticheat externo)
+https://cdn.stellarfn.dev/Arc/Config.json y Arc/Splash.png
+Opcional pakchunkStellarBubble-* si game.bubbleWrapEnabled; si está desactivado, borra los paks bubble con invoke("delete_file").
+Si falta algo → overlay RequiredFilesDownloader que descarga con invoke("download_file_command") escuchando el evento Tauri download-progress (emitido desde Rust con downloaded/total/percentage/file_name).
+Verifica que exista FortniteGame\Binaries\Win64\FortniteClient-Win64-Shipping.exe.
+Auth de lanzamiento:
+GET <ruta "oauth">/exchange con Authorization: bearer <jwt> → { code } (exchange code).
+GET <ruta "account">/session con Authorization: bearer <jwt> y header X-Arc-Client: rokzoyzmxxjqekqdqkipgkdueoybqjqo → { auth: { token } } (identidad para el anticheat Arc).
+invoke("launch", { code, path, extraArgs, identity }), minimiza la ventana (window.getCurrentWindow().minimize()) y envía notificación nativa.
+Comando Rust launch (src-tauri/src/commands/builds.rs, líneas 135–285)
+Borra Engine\Binaries\ThirdParty\NVIDIA\NVaftermath\Win64\GFSDK_Aftermath_Lib.x64.dll (hasta 50 reintentos de 20 ms) y recrea el directorio — elimina el crash reporter de NVIDIA.
+No inyecta DLLs: no hay CreateRemoteThread/WriteProcessMemory/LoadLibrary en ningún archivo (las features memoryapi de winapi están declaradas en Cargo.toml pero sin uso). El "anticheat" es un proceso externo (Arc.exe) descargado en el build.
+No usa puerto local ni -AUTH_PORT=: el auth es el exchange code oficial de Epic (-AUTH_TYPE=exchangecode), y la sesión la valida Arc mediante -t=<token>.
+Spawn de 3 procesos con el mismo fort_args:
+<build>\Arc\Arc.exe — CREATE_NO_WINDOW
+<build>\FortniteGame\Binaries\Win64\FortniteLauncher.exe — CREATE_NO_WINDOW | CREATE_SUSPENDED
+<build>\FortniteGame\Binaries\Win64\FortniteClient-Win64-Shipping_BE.exe — CREATE_NO_WINDOW | CREATE_SUSPENDED
+Fragmento exacto de los argumentos (builds.rs:194-210):
+
+
+rust
+let exchange_arg = &format!("-AUTH_PASSWORD={}", code);
+let arc_identity = &format!("-t={}", identity);
+
+let mut fort_args = vec![
+    "-epicapp=Fortnite", "-epicenv=Prod", "-epiclocale=en-us",
+    "-epicportal", "-nobe", "-nouac", "-nocodeguards",
+    "-fromfl=eac", "-fltoken=3db3ba5dcbd2e16703f3978d",
+    "-caldera=eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCJ9....", // JWT ES256 hardcodeado (acProvider EasyAntiCheat)
+    "-skippatchcheck",
+    "-AUTH_LOGIN=",
+    exchange_arg,          // -AUTH_PASSWORD=<exchangeCode>
+    "-AUTH_TYPE=exchangecode",
+    arc_identity,          // -t=<token de /session>
+];
+extraArgs (desde Settings, generados en handlePlay.ts:224-240): -dpe (disable pre-edits), -ror (reset on release), -preferreditems=Rifle:1,Shotgun:2,... (loadout de game.preferredItemsCmd).
+
+exit_all (mismo archivo): snapshot CreateToolhelp32Snapshot + TerminateProcess sobre FortniteClient-Win64-Shipping.exe, FortniteLauncher.exe, _EAC.exe, _BE.exe, EasyAntiCheat_EOS.exe, EpicWebHelper.exe, Arc.exe, EpicGamesLauncher.exe; duerme 1 s.
+Hay un bloque comentado de run_elevated (ShellExecuteW con runas) para escribir MaxLoaderThreads en IFEO del registro.
+Cierre de juego: src/utils/library/handleClose.ts (exit_all + resetear estado del build).
+5. Configuración persistente
+localStorage, no archivos ni zustand/persist. Wrapper propio en src/stellar/Storage.ts: claves con prefijo stellar: (ej. stellar:auth.jwt), serializa JSON automáticamente, clear() borra solo las suyas.
+Claves usadas: auth.jwt, auth.base, auth.account, auth.athena (AuthStore), routing.store (RoutingStore), theme.current (ThemeStore), game.disablePreEdits, game.resetOnRelease, game.bubbleWrapEnabled, game.preferredItemSlots, game.preferredItemsCmd (GameOptionsPage), reward_modal_shown_* (RewardsStore, con localStorage directo).
+BuildStore (src/zustand/BuildStore.tsx): Map<string, IBuild> serializado bajo la clave builds (sin prefijo), normalizando rutas (\\→/, lowercase).
+Sin tauri-plugin-store: la configuración vive en el webview, no en disco del sistema.
+6. Pantallas y flujo de usuario
+Login (/) — splash animado "Welcome to Stellar" (2.4 s) → tarjeta glass con botón Discord → deep link.
+Home (/home) — saludo por hora del día + jugadores online (GET <public>/online, poll cada 10 s), Banner carrusel autoplay (4 s, glow dinámico por post, BannerStore), GithubChangelogs (commits vía GET <public>/github), Donate (abre https://stellarogfn.sell.app/), modal MonthlyRewardsNotification (GET <rewards>/<accountId> / POST <rewards>/claim).
+Library (/library) — grid de BuildCard con splash real (FortniteGame\Content\Splash\Splash.bmp vía convertFileSrc + asset protocol), play/pausa, borrar. Botón + → ImportBuildModal: selector de carpeta (plugin-dialog), detección de versión binaria (search_for_version escanea el exe buscando el patrón UTF-16LE ++Fortnite y aplica regex /\+\+Fortnite\+Release-(\d+\.\d+|Cert)-CL-(\d+)/; para builds Cert/Live usa src/utils/configuration/versionMap.ts, mapa changelist→versión, ej. 3870737 → 2.4.2).
+Settings (/settings) — subnav con 4 páginas: GameOptions (toggles + loadout visual de 5 slots con iconos T-Icon-*), Options (placeholder WIP), Theme (5 presets Default/Void/Ember/Frost/Jade + GradientModal con dial de ángulo arrastrable y 4 color stops), Developer (vacío).
+Leaderboards (/leaderboards) — tabs Leaderboard/Tournaments; paginación editable (7/page), GET <leaderboards>?page&limit y /rank/<accountId>; torneos con TournamentEventWindow (scoring rules, payouts, windows) y SessionLeaderboard.
+Global: Frame (titlebar frameless con minimizar/cerrar), Sidebar izquierdo de 64 px (logo con glow pulsante, avatar → dropdown con editar username POST <base>/change-username, settings, logout), sistema de Toasts global.
+7. Componentes UI reutilizables destacados
+src/components/Core/Particles.tsx — fondo de partículas en <canvas> (85 unidades, respawnean al salir, magnetismo/parallax hacia el mouse con staticity/ease/magnetism, escala por devicePixelRatio).
+Sistema "liquid glass" (tailwind.config.js plugin inline): .liquid-glass, .glass-effect (usa filter: url(#glass-distortion) — filtro SVG feTurbulence + feDisplacementMap definido en src/main.tsx), .glass-tint, .glass-shine, .glass-content; textura bg-glass-noise (SVG fractalNoise base64); sombras glass, glass-shine, glass-active.
+src/components/Global/GlassContainer.tsx — contenedor base reutilizado en todo (blur + saturate + borde blanco/20).
+src/components/Global/Toast.tsx — toasts con entrada spring (blur+scale), glow del icono pulsante, barra de progreso temporal animada, AnimatePresence popLayout.
+src/components/Home/Donate.tsx — estrellas StellarStar.png cayendo con twinkle (opacidad y escala keyframed).
+src/components/Settings/modal/GradientModal.tsx — editor de gradiente con dial de ángulo drag (atan2 → grados).
+src/components/Library/BuildCard.tsx — hover con zoom del splash, botones deslizantes (translate-x-10 → 0), spinner de carga.
+src/components/Home/Banner.tsx — carrusel con glow por post y barra de autoplay scaleX lineal.
+8. Backend Rust/Tauri (detalles)
+src-tauri/src/lib.rs: builder con plugins (nota: tauri_plugin_single_instance está registrado dos veces, bug menor) y generate_handler![builds::search_for_version, builds::check_file_exists_and_size, builds::check_file_exists, builds::launch, builds::exit_all, download::download_file_command, download::get_file_size, download::delete_file].
+Comandos invoke usados desde el frontend: exit_all, launch, check_file_exists, check_file_exists_and_size, delete_file, get_file_size, download_file_command, search_for_version.
+download.rs: download_file_command (reqwest async, streaming por chunks, emite evento de ventana download-progress), get_file_size (HEAD-like con ACCEPT_ENCODING: identity y redirect(Policy::limited(10))), delete_file.
+builds.rs: search_for_version escanea bytes del exe buscando el patrón 2b 00 2b 00 46 00 6f 00 72 74 6e 69 74 65 2b 00... (++Fortnite+ en UTF-16LE) y reconstruye el string.
+tauri.conf.json: ventana 1100x640, decorations: false, transparent: true, centrada; deep-link stellar://; updater con pubkey minisign y endpoint CDN; csp: null; asset protocol con scope */** (para mostrar los Splash.bmp de los builds).
+capabilities/default.json: HTTP del plugin restringido a https://*.stellarfn.dev (aunque las llamadas a cloud.arc-services.dev se hacen con axios del webview, no con el plugin http).
+Observaciones / deuda técnica
+node_modules no está instalado (0 entradas), y arc-services@0.1.1 (SDK del anticheat Arc, instanciado en src/stellar/index.ts con ClientID: "rokzoyzmxxjqekqdqkipgkdueoybqjqo", stage dev) no se puede inspeccionar localmente.
+Código WIP/roto: OptionsPage.tsx con placeholders, Header.tsx con nombre hardcodeado "andr1ww", AuthStore.init() tiene el fetch comentado (solo valida que exista auth.account), doble registro de single_instance, Tailwind v3/v4 mezclados, tokio pineado a =1.32.0.
